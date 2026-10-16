@@ -1,5 +1,6 @@
 """Jarvis settings (API key, names). Stored as JSON in the app's private data dir."""
-import json, os
+import json
+import os
 
 def _path():
     return os.path.join(os.environ.get("JARVIS_HOME", "."), "config.json")
@@ -12,7 +13,8 @@ def _load():
         return {}
 
 def _patch(**kw):
-    d = _load(); d.update(kw)
+    d = _load()
+    d.update(kw)
     os.makedirs(os.path.dirname(_path()) or ".", exist_ok=True)
     with open(_path(), "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2)
@@ -34,7 +36,14 @@ def get_assistant_name() -> str:
 
 def get_lang() -> str:
     """Speech-recognition language: 'ar-EG' (Egyptian Arabic) or 'en-US'."""
-    return (_load().get("voice_lang") or "ar-EG")
+    return _load().get("voice_lang") or "ar-EG"
 
 def set_lang(l: str):
     _patch(voice_lang=l)
+
+def get_model_name() -> str:
+    """Returns the active Gemini model name, defaulting to gemini-3.8-flash."""
+    return _load().get("model_name") or "gemini-3.8-flash"
+
+def set_model_name(m: str):
+    _patch(model_name=m.strip())
