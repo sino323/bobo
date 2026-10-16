@@ -1,0 +1,27 @@
+name: Build Jarvis APK
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip openjdk-17-jdk ccache cmake \
+            autoconf automake libtool libtool-bin libltdl-dev m4 pkg-config gettext \
+            build-essential libffi-dev libssl-dev zlib1g-dev libbz2-dev \
+            libreadline-dev libsqlite3-dev libncurses-dev tk-dev uuid-dev \
+            liblzma-dev xz-utils
+      - name: Install buildozer
+        run: pip install --upgrade pip buildozer "cython<3" setuptools wheel
+      - name: Build APK
+        run: buildozer -v android debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-apk
+          path: bin/*.apk
