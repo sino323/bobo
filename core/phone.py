@@ -20,12 +20,114 @@ def _start(intent):
     intent.addFlags(autoclass("android.content.Intent").FLAG_ACTIVITY_NEW_TASK)
     _act().startActivity(intent)
 
-# ---------------- voice input (Google speech dialog) ----------------
+# ---------------- voice input (built-in recognizer, no popup) ----------------
+_sr = None
+_sr_keep = None
+mic_level = 0.0      # live 0..1 loudness, drives the head animation
+last_error = 0       # last recognizer error code (6/7 = silence / no match, 9 = no permission)
+
+def _fire(callback, text, err=0):
+    global last_error, mic_level
+    last_error, mic_level = err, 0.0
+    from kivy.clock import Clock
+    Clock.schedule_once(lambda dt: callback(text))
+
+def _make_listener(callback):
+    from jnius import PythonJavaClass, java_method, autoclass
+
+    class _L(PythonJavaClass):
+        __javainterfaces__ = ["android/speech/RecognitionListener"]
+        __javacontext__ = "app"
+
+        @java_method("(Landroid/os/Bundle;)V")
+        def onReadyForSpeech(self, b): pass
+        @java_method("()V")
+        def onBeginningOfSpeech(self): pass
+        @java_method("(F)V")
+        def onRmsChanged(self, rms):
+            global mic_level
+            mic_level = max(0.0, min(1.0, (rms + 2) / 12.0))
+        @java_method("([B)V")
+        def onBufferReceived(self, buf): pass
+        @java_method("()V")
+        def onEndOfSpeech(self): pass
+        @java_method("(Landroid/os/Bundle;)V")
+        def onPartialResults(self, b): pass
+        @java_method("(ILandroid/os/Bundle;)V")
+        def onEvent(self, t, b): pass
+        @java_method("(I)V")
+        def onError(self, code):
+            _fire(callback, None, int(code))
+        @java_method("(Landroid/os/Bundle;)V")
+        def onResults(self, b):
+            text = None
+            try:
+                SR = autoclass("android.speech.SpeechRecognizer")
+                lst = b.getStringArrayList(SR.RESULTS_RECOGNITION)
+                if lst is not None and lst.size() > 0:
+                    text = str(lst.get(0))
+            except Exception:
+                text = None
+            _fire(callback, text, 0 if text else 7)
+    return _L()
+
 def listen(lang, callback) -> bool:
-    """Open the system speech dialog. callback(text or None) runs on the Kivy thread."""
-    global _cb, _bound
+    """Listen inside the app. callback(text or None) runs on the Kivy thread."""
     if not ANDROID:
         return False
+    try:
+        from android.permissions import request_permissions, check_permission, Permission
+        if not check_permission(Permission.RECORD_AUDIO):
+            def _granted(perms, grants):
+                if grants and all(grants):
+                    listen(lang, callback)
+                else:
+                    _fire(callback, None, 9)
+            request_permissions([Permission.RECORD_AUDIO], _granted)
+            return True
+        return _listen_builtin(lang, callback)
+    except Exception:
+        return _listen_dialog(lang, callback)
+
+def _listen_builtin(lang, callback) -> bool:
+    from android.runnable import run_on_ui_thread
+
+    @run_on_ui_thread
+    def go():
+        global _sr, _sr_keep
+        try:
+            from jnius import autoclass
+            SR = autoclass("android.speech.SpeechRecognizer")
+            RI = autoclass("android.speech.RecognizerIntent")
+            Intent = autoclass("android.content.Intent")
+            if not SR.isRecognitionAvailable(_act()):
+                if not _listen_dialog(lang, callback):
+                    _fire(callback, None, 12)
+                return
+            if _sr is not None:
+                try: _sr.destroy()
+                except Exception: pass
+            _sr_keep = _make_listener(callback)
+            _sr = SR.createSpeechRecognizer(_act())
+            _sr.setRecognitionListener(_sr_keep)
+            i = Intent(RI.ACTION_RECOGNIZE_SPEECH)
+            i.putExtra(RI.EXTRA_LANGUAGE_MODEL, RI.LANGUAGE_MODEL_FREE_FORM)
+            i.putExtra(RI.EXTRA_LANGUAGE, lang)
+            i.putExtra(RI.EXTRA_PARTIAL_RESULTS, True)
+            i.putExtra(RI.EXTRA_MAX_RESULTS, 1)
+            _sr.startListening(i)
+        except Exception:
+            _fire(callback, None, 5)
+    go()
+    return True
+
+# fallback only: the old system dialog, used if the in-app recognizer is missing
+_RC = 7001
+_cb = None
+_bound = False
+
+def _listen_dialog(lang, callback) -> bool:
+    global _cb, _bound
     try:
         from jnius import autoclass
         from android import activity
@@ -60,8 +162,7 @@ def _result(request, result, intent):
         text = None
     cb, _cb = _cb, None
     if cb:
-        from kivy.clock import Clock
-        Clock.schedule_once(lambda dt: cb(text))
+        _fire(cb, text, 0 if text else 7)
 
 # ---------------- spoken replies (native TextToSpeech) ----------------
 def init_tts():
@@ -111,6 +212,16 @@ def stop():
         _tts.stop()
     except Exception:
         pass
+    if ANDROID and _sr is not None:
+        try:
+            from android.runnable import run_on_ui_thread
+            @run_on_ui_thread
+            def _c():
+                try: _sr.cancel()
+                except Exception: pass
+            _c()
+        except Exception:
+            pass
 
 # ---------------- phone actions (called by Gemini tools) ----------------
 APPS = {"whatsapp": "com.whatsapp", "youtube": "com.google.android.youtube",
@@ -147,7 +258,42 @@ def open_url(url):
     _start(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
     return "opened"
 
+def wake_pc() -> str:
+    """Wake-on-LAN: send the magic packet straight from Jarvis (what Wolow's power button does)."""
+    import socket, re as _re
+    from . import config
+    mac = _re.sub(r"[^0-9a-fA-F]", "", config.get_pc_mac())
+    if len(mac) != 12:
+        if ANDROID:
+            try:
+                return "No PC MAC address saved (Settings > PC MAC). " + open_app("wolow") + " - press the power button there."
+            except Exception:
+                pass
+        return "No PC MAC address saved. Add it in Settings (PC MAC)."
+    pkt = b"\xff" * 6 + bytes.fromhex(mac) * 16
+    targets = {("255.255.255.255", 9), ("255.255.255.255", 7)}
+    try:  # also the subnet broadcast (e.g. 192.168.1.255), which some routers need
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close()
+        b = ip.rsplit(".", 1)[0] + ".255"
+        targets |= {(b, 9), (b, 7)}
+    except Exception:
+        pass
+    sent = 0
+    for host, port in targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            for _ in range(3):
+                s.sendto(pkt, (host, port)); sent += 1
+            s.close()
+        except Exception:
+            pass
+    return "wake packet sent to your PC" if sent else "could not send the wake packet (check Wi-Fi)"
+
 def run(name, a) -> str:
+    if name == "wake_pc":
+        return wake_pc()
     if not ANDROID:
         return "Phone actions only work in the Android app."
     from jnius import autoclass

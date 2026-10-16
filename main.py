@@ -111,6 +111,13 @@ _ll = math.sqrt(sum(x * x for x in LIGHT)); LIGHT = tuple(x / _ll for x in LIGHT
 STATES = {"idle": ("IDLE", CYAN), "thinking": ("THINKING", YELLOW),
           "listening": ("LISTENING", GREEN), "speaking": ("SPEAKING", CYAN)}
 
+def _mic_level():
+    try:
+        from core import phone
+        return phone.mic_level
+    except Exception:
+        return 0.0
+
 class Head(Widget):
     state = StringProperty("idle")
 
@@ -123,7 +130,7 @@ class Head(Widget):
         self.t += dt
         t, st = self.t, self.state
         tg = {"speaking": .3 + .7 * abs(math.sin(t * 9) * math.sin(t * 2.3)) + random.random() * .15,
-              "thinking": .35, "listening": .2 + .5 * abs(math.sin(t * 5)),
+              "thinking": .35, "listening": .15 + .85 * max(_mic_level(), .15 * abs(math.sin(t * 5))),
               "idle": .06 + .04 * math.sin(t * 2)}.get(st, .1)
         self.level += (tg - self.level) * .25
         if self.width < 10 or self.height < 10:
@@ -201,7 +208,7 @@ class JarvisApp(App):
         from core import config, memory, phone
         from core.engine import Jarvis
         self.cfg, self.ai, self.phone = config, Jarvis(), phone
-        self.voice_chat, self.busy, self.req_id = False, False, 0
+        self.voice_chat, self.busy, self.req_id, self.mic_retry = False, False, 0, 0
         self.t0, self._net = time.time(), None
         phone.init_tts()
         memory.load()  # seeds long-term memory on first run
@@ -334,16 +341,23 @@ class JarvisApp(App):
                        hint_text="Gemini API Key", size_hint_y=None, height=dp(48))
         ni = TextInput(text=self.cfg.get_user_name(), multiline=False,
                        hint_text="Your name (how Jarvis addresses you)", size_hint_y=None, height=dp(48), **fkw())
+        mi = TextInput(text=self.cfg.get_model(), multiline=False,
+                       hint_text="Model (leave empty = automatic)", size_hint_y=None, height=dp(48), **fkw())
+        pi = TextInput(text=self.cfg.get_pc_mac(), multiline=False,
+                       hint_text="PC MAC address (AA:BB:CC:DD:EE:FF) for 'open PC'", size_hint_y=None, height=dp(48))
         def ok(*_):
             if ki.text.strip():
+                self.cfg.set_pc_mac(pi.text)
                 self.cfg.set_key(ki.text)
                 self.cfg.set_user_name(ni.text)
+                self.cfg.set_model(mi.text)
+                self.ai.dead.clear(); self.ai.good = None
                 pop.dismiss()
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-        box.add_widget(ki); box.add_widget(ni)
+        box.add_widget(ki); box.add_widget(ni); box.add_widget(mi); box.add_widget(pi)
         box.add_widget(Button(text="Save", size_hint_y=None, height=dp(48), on_release=ok))
         pop = Popup(title="Jarvis Setup" if first else "Settings", content=box,
-                    size_hint=(.92, .5), auto_dismiss=not first)
+                    size_hint=(.92, .75), auto_dismiss=not first)
         pop.open()
 
     # ----- voice
@@ -375,10 +389,21 @@ class JarvisApp(App):
             self.add("Jarvis", "Voice input needs the Android app with Google speech services.", "00e5ff")
 
     def heard(self, text):
-        if not text:  # dialog dismissed or nothing heard
-            self.ring.state = "idle"; self.set_vc(False)
+        if text:
+            self.mic_retry = 0
+            self.submit(text)
             return
-        self.submit(text)
+        err = getattr(self.phone, "last_error", 0)
+        self.ring.state = "idle"
+        if self.voice_chat and err in (6, 7) and self.mic_retry < 4:  # silence: keep listening
+            self.mic_retry += 1
+            Clock.schedule_once(lambda dt: self.mic() if self.voice_chat and not self.busy else None, .6)
+            return
+        self.set_vc(False)
+        if err == 9:
+            self.add("Jarvis", "Microphone permission is off. Allow Microphone for Jarvis in Android settings.", "00e5ff")
+        elif err not in (0, 6, 7):
+            self.add("Jarvis", "Speech recognition error (%d). Check internet or install a speech language pack." % err, "00e5ff")
 
     def send(self, *_):
         t = self.inp.text.strip()
